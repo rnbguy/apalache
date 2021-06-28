@@ -71,7 +71,9 @@ class EtcTypeChecker(varPool: TypeVarPool, inferPolytypes: Boolean = false) exte
       // an inline type declaration
       case EtcTypeDecl(name: String, declaredType: TlaType1, scopedEx: EtcExpr) =>
         // Just propagate the annotated name down the tree. It will be used in a let definition.
-        val extCtx = new TypeContext(ctx.types + (name -> declaredType))
+        // All free type variables in the type are considered to be universally quantified.
+        val allVars = declaredType.usedNames
+        val extCtx = new TypeContext(ctx.namesInScope, ctx.poolSize, ctx.types + (name -> (declaredType, allVars)))
         // to propagate the type to the listener, add the trivial constraint: a = declaredType
         val fresh = varPool.fresh
         val clause = EqClause(fresh, declaredType)
@@ -82,7 +84,7 @@ class EtcTypeChecker(varPool: TypeVarPool, inferPolytypes: Boolean = false) exte
       // a variable name, either an operator name, or a variable introduced by lambda (EtcAbs)
       case EtcName(name) =>
         if (ctx.types.contains(name)) {
-          val knownType = ctx.types(name)
+          val (knownType, allVars) = ctx.types(name)
           if (knownType.usedNames.isEmpty) {
             // This is a monotype. Report it right away.
             onTypeFound(ex.sourceRef, knownType)
@@ -166,8 +168,15 @@ class EtcTypeChecker(varPool: TypeVarPool, inferPolytypes: Boolean = false) exte
       // Operator application by name. Resolve the name and pass the resolved expression to the application case.
       case EtcAppByName(name, args @ _*) =>
         if (ctx.types.contains(name.name)) {
-          val nameType = ctx.types(name.name)
+          var (nameType, allVars) = ctx.types(name.name)
           onTypeFound(name.sourceRef, nameType)
+          if (allVars.nonEmpty && !ctx.namesInScope.contains(name.name)) {
+            // The type is parametric: instantiate it with new type variables.
+            // We do not instantiate the type if the call is recursive.
+            val varRenamingMap = allVars.toSeq.map(i => i -> varPool.fresh)
+            nameType = Substitution(varRenamingMap: _*)(nameType)
+          }
+
           computeRec(ctx, solver, mkApp(ex.sourceRef, Seq(nameType), args: _*))
         } else {
           onTypeError(ex.sourceRef, s"The operator $name is used before it is defined.")
@@ -181,7 +190,7 @@ class EtcTypeChecker(varPool: TypeVarPool, inferPolytypes: Boolean = false) exte
         val underlyingType = computeRec(extCtx, solver, scopedEx)
         // introduce a variable for lambda, in order to propagate the type to the listener
         val lambdaTypeVar = varPool.fresh
-        val varNames = binders.map { case (name, _) => extCtx(name.name) }
+        val varNames = binders.map { case (name, _) => extCtx(name.name)._1 }
         val operType = OperT1(varNames, underlyingType)
         // lambdaTypeVar = (a_1, ..., a_k) => resType
         val lambdaClause = EqClause(lambdaTypeVar, operType)
@@ -200,30 +209,38 @@ class EtcTypeChecker(varPool: TypeVarPool, inferPolytypes: Boolean = false) exte
 
         // introduce a new instance of the constraint solver for the operator definition
         val letInSolver = new ConstraintSolver()
-        val operSig =
+        val (operSig, operAllVars) =
           ctx.types.get(name) match {
-            case Some(declaredType @ OperT1(_, _)) =>
-              declaredType
+            case Some((declaredType @ OperT1(_, _), allVars)) =>
+              (declaredType, allVars)
 
-            case Some(someType: TlaType1) =>
+            case Some((someType: TlaType1, allVars)) =>
               // The definition has a type annotation which is not an operator. Assume it is a nullary operator.
               // Strictly speaking, this is a hack. However, it is quite common to declare a constant with LET.
-              OperT1(Seq(), someType)
+              (OperT1(Seq(), someType), allVars)
 
             case None =>
               // Let the solver compute the type. If it fails, the user has to annotate the definition
-              lir.OperT1(1.to(binders.length).map(_ => varPool.fresh), varPool.fresh)
+              val freshArgs = 1.to(binders.length).map(_ => varPool.fresh)
+              val freshRes = varPool.fresh
+              val freeVars = (freshArgs :+ freshRes).map(_.no).toSet
+              (lir.OperT1(freshArgs, freshRes), freeVars)
           }
 
         // translate the binders in the lambda expression, so we can quickly propagate the types of the parameters
-        val preCtx = new TypeContext((ctx.types + (name -> operSig)).mapValues(approxSolution(_)))
+        val preCtx =
+          new TypeContext(ctx.namesInScope + name, ctx.poolSize,
+              (ctx.types + (name -> (operSig, operAllVars))).mapValues(p => (approxSolution(p._1), p._2)))
         val extCtx = translateBinders(preCtx, letInSolver, binders)
-        val annotationParams = operSig.asInstanceOf[OperT1].args
-        annotationParams.zip(binders.map { case (pname, _) => (pname, extCtx(pname.name)) }).foreach {
+        val annotationParams = operSig.args
+        annotationParams.zip(binders.map { case (pname, _) => (pname, extCtx(pname.name)._1) }).foreach {
           case (annotParam, (pname, paramVar @ VarT1(_))) =>
             val clause = EqClause(paramVar, annotParam)
               .setOnTypeError((_, ts) => s"Mismatch in parameter $pname. Found: " + ts.head)
             letInSolver.addConstraint(clause)
+
+          case b =>
+            throw new IllegalStateException("Unexpected binder: " + b)
         }
 
         // produce constraints for the operator signature
@@ -240,7 +257,7 @@ class EtcTypeChecker(varPool: TypeVarPool, inferPolytypes: Boolean = false) exte
 
         // compute the constraints for the operator definition
         val defBodyType = computeRec(extCtx, letInSolver, defBody)
-        val paramTypes = binders.map(p => extCtx(p._1.name))
+        val paramTypes = binders.map(p => extCtx(p._1.name)._1)
         val defType = OperT1(paramTypes, defBodyType)
         // add the constraint from the annotation
         val defClause = EqClause(operVar, defType)
@@ -249,17 +266,20 @@ class EtcTypeChecker(varPool: TypeVarPool, inferPolytypes: Boolean = false) exte
 
         letInSolver.addConstraint(defClause)
 
-        val preciseDefType =
+        val (preciseDefType, preciseAllVars) =
           letInSolver.solve() match {
             case None =>
               onTypeError(ex.sourceRef, s"Error when computing the type of $name")
               throw new UnwindException
 
             case Some(sub) =>
-              sub(defType)
+              (sub(defType), subFreeVars(operAllVars, sub))
           }
 
-        if (!inferPolytypes && preciseDefType.usedNames.nonEmpty) {
+        // recompute the free variables of the operator
+
+        val isPoly = preciseAllVars.nonEmpty
+        if (!inferPolytypes && isPoly) {
           onTypeError(ex.sourceRef,
               s"Expected a concrete type of operator $name, found polymorphic type: " + preciseDefType)
           throw new UnwindException
@@ -268,13 +288,38 @@ class EtcTypeChecker(varPool: TypeVarPool, inferPolytypes: Boolean = false) exte
         // TODO: check that the inferred signature matches the annotation?
 
         // compute the type of the expression under the definition
-        val underCtx = new TypeContext(ctx.types + (name -> preciseDefType))
-        computeRec(underCtx, solver, scopedEx)
+        val underCtx =
+          new TypeContext(ctx.namesInScope, varPool.size, ctx.types + (name -> (preciseDefType, preciseAllVars)))
+        val resultType = computeRec(underCtx, solver, scopedEx)
+        // the expression under let-in may further refine a parameterized operator signature
+        if (isPoly) {
+          solver.solve() match {
+            case Some(sub) =>
+              val refinedType = sub(preciseDefType)
+              if (refinedType != preciseDefType) {
+                onTypeFound(defEx.sourceRef, refinedType)
+              }
+          }
+        }
+
+        resultType
 
       // an ill-formed let expression
       case EtcLet(_, _, _) =>
         throw new RuntimeException("Bug in type checker. Ill-formed let-expression: " + ex)
     }
+  }
+
+  // rename free variables according to the substitution
+  private def subFreeVars(vars: Set[Int], sub: Substitution): Set[Int] = {
+    def merge(set: Set[Int], i: Int): Set[Int] = {
+      sub(VarT1(i)) match {
+        case VarT1(no) => set + no
+        case _         => set
+      }
+    }
+
+    vars.foldLeft(Set[Int]())(merge)
   }
 
   // produce constraints for the binders that are used in a lambda expression
@@ -304,8 +349,10 @@ class EtcTypeChecker(varPool: TypeVarPool, inferPolytypes: Boolean = false) exte
       val clause = EqClause(typeVar, typeVar).setOnTypeFound(onTypeFound(name.sourceRef, _))
       solver.addConstraint(clause)
     }
-    // compute the expression in the scope, by associating the variables names with the elements of elemVars
-    new TypeContext(ctx.types ++ binders.map(_._1.name).zip(elemVars))
+    // Compute the expression in the scope, by associating the variables names with the elements of elemVars.
+    // Note that elemVars are not universally quantified.
+    val varNames = binders.map(_._1.name).zip(elemVars.map((_, Set[Int]())))
+    new TypeContext(ctx.namesInScope, varPool.size, ctx.types ++ varNames)
   }
 
   private def onTypeFound(sourceRef: EtcRef, tt: TlaType1): Unit = {
