@@ -328,7 +328,7 @@ prevent name clashes. In the [MissionariesAndCannibals.tla][] example, we have
 
 ```tla
 \* @typeAlias: PERSONS = Set(PERSON);
-MCTypeAliases = TRUE
+MCTypeAliases == TRUE
 ```
 
 Having defined the type alias, we can use it in other definitions anywhere else 
